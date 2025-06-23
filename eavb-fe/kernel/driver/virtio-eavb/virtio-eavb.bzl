@@ -11,7 +11,10 @@ def eavb_get_srcs():
 def define_target_variant_module(target, variant):
     tv = "{}_{}".format(target, variant)
     rule_name = "{}_virtio_eavb".format(tv)
-    kernel_build = "//msm-kernel:{}".format(tv)
+    kernel_build = select({
+        "//build/kernel/kleaf:socrepo_true": "//soc-repo:{}_base_kernel".format(tv),
+        "//build/kernel/kleaf:socrepo_false": "//msm-kernel:{}".format(tv),
+    })
 
     ddk_module(
         name = rule_name,
@@ -19,8 +22,9 @@ def define_target_variant_module(target, variant):
         srcs = eavb_get_srcs(),
         hdrs = ["vio_eavb.h",
             "eavb_shared.h"],
-        deps = [
-            "//msm-kernel:all_headers"],
+        deps = ["//common:all_headers",
+                "//soc-repo:all_headers",
+            ],
         kernel_build = kernel_build,
         visibility = ["//visibility:public"]
     )
@@ -28,7 +32,7 @@ def define_target_variant_module(target, variant):
     copy_to_dist_dir(
         name = "{}_dist".format(rule_name),
         data = [rule_name],
-        dist_dir = "out/eavb",
+        dist_dir = "out/target/product/{}/dlkm/lib/modules/".format(target),
         flat = True,
         wipe_dist_dir = False,
         allow_duplicate_filenames = False,
@@ -37,5 +41,6 @@ def define_target_variant_module(target, variant):
     )
 
 def define_target_module(target):
+    define_target_variant_module(target, "perf")
     define_target_variant_module(target, "gki")
     define_target_variant_module(target, "consolidate")
