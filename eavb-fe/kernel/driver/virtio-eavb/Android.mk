@@ -4,6 +4,7 @@ LOCAL_PATH := $(call my-dir)
 
 LOCAL_MODULE_DDK_BUILD := true
 LOCAL_MODULE_DDK_ALLOW_UNSAFE_HEADERS := true
+LOCAL_MODULE_KO_DIRS := eavb_fe.ko
 
 #Clear Environment Variables
 include $(CLEAR_VARS)
