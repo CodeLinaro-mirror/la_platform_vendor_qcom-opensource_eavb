@@ -18,10 +18,14 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/sched/clock.h>
-#include <soc/qcom/boot_stats.h>
 #include "eavb_shared.h"
 
 #include "vio_eavb.h"
+
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
+#include <soc/qcom/boot_stats.h>
+#endif
 
 /* Virtio ID of eavb : 0xC006 */
 #define VIRTIO_ID_EAVB		49158
@@ -1224,7 +1228,7 @@ static int qavb_receive(struct eavb_file *fl, void __user *buf)
 		memcpy(&receive.data, &vmsg->data,
 				sizeof(struct eavb_buf_data));
 		if (receive.received)
-			LOG_EAVB(LEVEL_DEBUG, "M - DRIVER EAVB FE First received data\n");
+			LOG_EAVB(LEVEL_DEBUG, "M - DRIVER EAVB FE received data %d\n", receive.received);
 	}
 
 	virt_free_msg(priv, msg);
@@ -1300,6 +1304,10 @@ static int qavb_transmit(struct eavb_file *fl, void __user *buf)
 		ret = vhdr->result;
 		vmsg = (struct vio_transmit_msg *)vhdr;
 		transmit.written = vmsg->written;
+		memcpy(&transmit.data, &vmsg->data,
+				sizeof(struct eavb_buf_data));
+		if (transmit.written)
+			LOG_EAVB(LEVEL_DEBUG, "M - DRIVER EAVB FE transmitted data %d\n", transmit.written);
 	}
 
 	virt_free_msg(priv, msg);
@@ -1515,11 +1523,19 @@ static void fe_recv_done(struct virtqueue *rvq)
 static int init_vqs(struct virtio_eavb_priv *priv)
 {
 	struct virtqueue *vqs[2];
-	static const char *const names[] = { "eavb_tx", "eavb_rx" };
-	vq_callback_t *cbs[] = {NULL, fe_recv_done};
 	int ret;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+	struct virtqueue_info vqs_info[] = {
+		{"eavb_tx",NULL},
+		{"eavb_rx",fe_recv_done},
+	};
+	ret = virtio_find_vqs(priv->vdev, 2, vqs, vqs_info, NULL);
+#else
+	static const char *const names[] = { "eavb_tx", "eavb_rx" };
+	vq_callback_t *cbs[] = {NULL, fe_recv_done};
 	ret = virtio_find_vqs(priv->vdev, 2, vqs, cbs, names, NULL);
+#endif
 	if (ret) {
 		LOG_EAVB(LEVEL_ERR, "virtio_find_vqs fail\n");
 		return ret;
@@ -1575,7 +1591,11 @@ static int virtio_eavb_probe(struct virtio_device *vdev)
 	if (ret)
 		goto free_chrdev;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+	priv->class = class_create("virt-eavb");
+#else
 	priv->class = class_create(THIS_MODULE, "virt-eavb");
+#endif
 	if (IS_ERR(priv->class))
 		goto class_create_fail;
 
