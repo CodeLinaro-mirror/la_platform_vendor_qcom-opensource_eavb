@@ -1677,6 +1677,54 @@ static void virtio_eavb_remove(struct virtio_device *vdev)
 	kfree(priv);
 }
 
+#ifdef CONFIG_PM_SLEEP
+static int virtio_eavb_freeze(struct virtio_device *vdev){
+
+	struct virtio_eavb_priv *priv;
+	LOG_EAVB(LEVEL_INFO, "M - DRIVER EAVB FREEZE \n");
+
+	priv = vdev->priv;
+
+	virtio_reset_device(vdev);
+	vdev->config->del_vqs(vdev);
+
+	return 0;
+}
+
+static int virtio_eavb_restore(struct virtio_device *vdev){
+
+	struct virtio_eavb_priv *priv = vdev->priv;
+	int ret,i;
+
+	LOG_EAVB(LEVEL_INFO, "M - DRIVER EAVB RESTORE \n");
+	ret = init_vqs(priv);
+	if (ret){
+		LOG_EAVB(LEVEL_ERR, "EAVB restore: init_vqs failed (%d)\n", ret);
+		return ret;
+	}
+
+	virtio_device_ready(vdev);
+
+	for (i = 0; i < FE_MSG_MAX; i++) {
+		struct scatterlist sg;
+		u8 *rxbuf;
+
+		rxbuf = priv->rxbufs[0] + i * RX_BUF_MAX_LEN;
+		priv->rxbufs[i] = rxbuf;
+
+		sg_init_one(&sg, rxbuf, RX_BUF_MAX_LEN);
+		ret = virtqueue_add_inbuf(priv->rvq, &sg, 1, rxbuf, GFP_KERNEL);
+		WARN_ON(ret);
+	}
+	virtqueue_disable_cb(priv->svq);
+
+	virtqueue_enable_cb(priv->rvq);
+	virtqueue_kick(priv->rvq);
+	LOG_EAVB(LEVEL_INFO, "M - DRIVER EAVB FE Ready\n");
+	return 0;
+}
+#endif
+
 
 static const struct virtio_device_id id_table[] = {
 	{ VIRTIO_ID_EAVB, VIRTIO_DEV_ANY_ID },
@@ -1696,6 +1744,11 @@ static struct virtio_driver virtio_eavb_driver = {
 	.id_table = id_table,
 	.probe = virtio_eavb_probe,
 	.remove = virtio_eavb_remove,
+
+#ifdef CONFIG_PM_SLEEP
+	.freeze = virtio_eavb_freeze,
+	.restore = virtio_eavb_restore,
+#endif
 };
 
 static int __init virtio_eavb_init(void)
