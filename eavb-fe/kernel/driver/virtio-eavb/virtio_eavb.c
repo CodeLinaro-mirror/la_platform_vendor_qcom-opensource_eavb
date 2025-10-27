@@ -1228,7 +1228,7 @@ static int qavb_receive(struct eavb_file *fl, void __user *buf)
 		memcpy(&receive.data, &vmsg->data,
 				sizeof(struct eavb_buf_data));
 		if (receive.received)
-			LOG_EAVB(LEVEL_DEBUG, "M - DRIVER EAVB FE First received data\n");
+			LOG_EAVB(LEVEL_DEBUG, "M - DRIVER EAVB FE received data %d\n", receive.received);
 	}
 
 	virt_free_msg(priv, msg);
@@ -1304,6 +1304,10 @@ static int qavb_transmit(struct eavb_file *fl, void __user *buf)
 		ret = vhdr->result;
 		vmsg = (struct vio_transmit_msg *)vhdr;
 		transmit.written = vmsg->written;
+		memcpy(&transmit.data, &vmsg->data,
+				sizeof(struct eavb_buf_data));
+		if (transmit.written)
+			LOG_EAVB(LEVEL_DEBUG, "M - DRIVER EAVB FE transmitted data %d\n", transmit.written);
 	}
 
 	virt_free_msg(priv, msg);

@@ -192,6 +192,7 @@ struct eavb_stream_info {
 	uint32_t ring_buffer_size;
 	int blocking_write;
 	double fill_level;
+	int tx_pkts_per_sec;
 } __packed;
 
 
