@@ -39,26 +39,37 @@
 #define DEVICE_NAME		"virt-eavb"
 #define DEVICE_NUM		1
 
-#define LEVEL_DEBUG	1
-#define LEVEL_INFO	2
-#define LEVEL_ERR	3
+enum {
+	LEVEL_DEBUG = 0,
+	LEVEL_INFO,
+	LEVEL_WARN,
+	LEVEL_ERR,
+};
 
 static unsigned int log_level = LEVEL_INFO;
 
-static char *prix[] = {"", "debug", "info", "error"};
+static char *prix[] = {"debug", "info", "warn", "error"};
+static const char *level_prefix[] = {
+	KERN_DEBUG,
+	KERN_INFO,
+	KERN_WARNING,
+	KERN_ERR,
+};
+
 static void log_eavb(int level, const char *fmt, ...)
 {
 	va_list args;
-
+	char buf[128] = {0};
 	if ((level) >= log_level) {
 		va_start(args, fmt);
-		vprintk(fmt, args);
+		vsnprintf(buf, sizeof(buf), fmt, args);
 		va_end(args);
+		printk("%s%s", level_prefix[level], buf);
 	}
 }
 #define LOG_EAVB(level, format, args...) \
 log_eavb(level, "eavb: pid %.8x: %s: %s(%d) "format, \
-current->pid, prix[0x3 & (level)], __func__, __LINE__, ## args)
+current->pid, prix[level], __func__, __LINE__, ## args)
 
 #define ASSERT(x) \
 do { \
@@ -1828,5 +1839,7 @@ static void __exit virtio_eavb_exit(void)
 module_init(virtio_eavb_init);
 module_exit(virtio_eavb_exit);
 
+module_param(log_level, uint, 0644);
+MODULE_PARM_DESC(log_level, "EAVB FE log level: 0=debug, 1=info, 2=warn, 3=err");
 MODULE_DESCRIPTION("Virtio eavb driver");
 MODULE_LICENSE("GPL");
