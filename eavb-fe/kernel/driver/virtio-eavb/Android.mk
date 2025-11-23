@@ -20,6 +20,8 @@ $(info value of TARGET_USES_KERNEL_PLATFORM IS '$(TARGET_USES_KERNEL_PLATFORM)')
 
 #Defining the local options
 LOCAL_SRC_FILES             :=  \
+                                $(LOCAL_PATH)/vio_eavb.h \
+                                $(LOCAL_PATH)/virtio_eavb.c \
                                 $(LOCAL_PATH)/Android.mk \
                                 $(LOCAL_PATH)/eavb_fe-board.mk \
                                 $(LOCAL_PATH)/eavb_fe-product.mk \
