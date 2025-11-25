@@ -288,6 +288,7 @@ struct eavb_ioctl_stream_info {
 	__u32 ring_buffer_size;
 	int blocking_write;
 	double fill_level;
+	int tx_pkts_per_sec;
 } __packed;
 
 struct eavb_ioctl_get_stream_info {
