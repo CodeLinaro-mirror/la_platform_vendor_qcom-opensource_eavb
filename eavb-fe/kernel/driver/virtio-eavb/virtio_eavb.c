@@ -83,6 +83,7 @@ do { \
 static unsigned int timeout_msec = 5000; /* default 5s */
 static unsigned int version_be_major = VERSION_MAJOR;
 static unsigned int version_be_minor = VERSION_MINOR;
+static unsigned int using_ver_check = 0;
 
 /*
  *    device_priv (struct virtio_eavb_priv)
@@ -863,50 +864,54 @@ static int virtio_eavb_release(struct inode *inode, struct file *file)
 
 static int exchange_version(struct virtio_eavb_priv *priv)
 {
-	struct fe_msg *msg;
-	struct vio_msg_hdr *vhdr;
-	struct vio_version_msg *vmsg;
-	int tsize, rsize;
-	int ret;
+	if (using_ver_check) {
+		struct fe_msg *msg;
+		struct vio_msg_hdr *vhdr;
+		struct vio_version_msg *vmsg;
+		int tsize, rsize;
+		int ret;
 
-	LOG_EAVB(LEVEL_INFO, "M - DRIVER EAVB FE version\n");
+		LOG_EAVB(LEVEL_INFO, "M - DRIVER EAVB FE version\n");
 
-	tsize = rsize = sizeof(struct vio_version_msg);
-	msg = virt_alloc_msg(priv, tsize, rsize);
-	if (!msg) {
-		LOG_EAVB(LEVEL_ERR, "version alloc msg fail!\n");
-		return -ENOMEM;
-	}
+		tsize = rsize = sizeof(struct vio_version_msg);
+		msg = virt_alloc_msg(priv, tsize, rsize);
+		if (!msg) {
+			LOG_EAVB(LEVEL_ERR, "version alloc msg fail!\n");
+			return -ENOMEM;
+		}
 
-	vhdr = (struct vio_msg_hdr *)msg->txbuf;
-	vhdr->cmd = VIRTIO_EAVB_T_VERSION;
-	vhdr->len = msg->txbuf_size;
-
-	vmsg = (struct vio_version_msg *)vhdr;
-	vmsg->major = VERSION_MAJOR;
-	vmsg->minor = VERSION_MINOR;
-
-	ret = send_msg(priv, msg);
-
-	vhdr = (struct vio_msg_hdr *)msg->rxbuf;
-	if (!ret && vhdr) {
-		ret = vhdr->result;
+		vhdr = (struct vio_msg_hdr *)msg->txbuf;
+		vhdr->cmd = VIRTIO_EAVB_T_VERSION;
+		vhdr->len = msg->txbuf_size;
 
 		vmsg = (struct vio_version_msg *)vhdr;
-		version_be_major = vmsg->major;
-		version_be_minor = vmsg->minor;
-		LOG_EAVB(LEVEL_INFO, "version: fe (%u.%u) : be (%u.%u)\n", VERSION_MAJOR, VERSION_MINOR, version_be_major, version_be_minor);
-		if (version_be_major != VERSION_MAJOR) {
-			ret = -EOPNOTSUPP;
-			LOG_EAVB(LEVEL_ERR, "Major version mismatch!!!\n");
+		vmsg->major = VERSION_MAJOR;
+		vmsg->minor = VERSION_MINOR;
+
+		ret = send_msg(priv, msg);
+
+		vhdr = (struct vio_msg_hdr *)msg->rxbuf;
+		if (!ret && vhdr) {
+			ret = vhdr->result;
+
+			vmsg = (struct vio_version_msg *)vhdr;
+			version_be_major = vmsg->major;
+			version_be_minor = vmsg->minor;
+			LOG_EAVB(LEVEL_INFO, "version: fe (%u.%u) : be (%u.%u)\n", VERSION_MAJOR, VERSION_MINOR, version_be_major, version_be_minor);
+			if (version_be_major != VERSION_MAJOR) {
+				ret = -EOPNOTSUPP;
+				LOG_EAVB(LEVEL_ERR, "Major version mismatch!!!\n");
+			}
+		} else {
+			LOG_EAVB(LEVEL_INFO, "exchange_version failed\n");
 		}
+
+		virt_free_msg(priv, msg);
+
+		return ret;
 	} else {
-		LOG_EAVB(LEVEL_INFO, "exchange_version failed\n");
+		return 0;
 	}
-
-	virt_free_msg(priv, msg);
-
-	return ret;
 }
 
 static int qavb_create_stream(struct eavb_file *fl, void __user *buf)
@@ -1838,6 +1843,9 @@ static void __exit virtio_eavb_exit(void)
 
 module_init(virtio_eavb_init);
 module_exit(virtio_eavb_exit);
+
+module_param(using_ver_check, uint, 0644);
+MODULE_PARM_DESC(using_ver_check, "default(0): don't use version check, 1: use version check");
 
 module_param(log_level, uint, 0644);
 MODULE_PARM_DESC(log_level, "EAVB FE log level: 0=debug, 1=info, 2=warn, 3=err");
