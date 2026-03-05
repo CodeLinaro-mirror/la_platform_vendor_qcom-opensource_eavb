@@ -39,26 +39,37 @@
 #define DEVICE_NAME		"virt-eavb"
 #define DEVICE_NUM		1
 
-#define LEVEL_DEBUG	1
-#define LEVEL_INFO	2
-#define LEVEL_ERR	3
+enum {
+	LEVEL_DEBUG = 0,
+	LEVEL_INFO,
+	LEVEL_WARN,
+	LEVEL_ERR,
+};
 
 static unsigned int log_level = LEVEL_INFO;
 
-static char *prix[] = {"", "debug", "info", "error"};
+static char *prix[] = {"debug", "info", "warn", "error"};
+static const char *level_prefix[] = {
+	KERN_DEBUG,
+	KERN_INFO,
+	KERN_WARNING,
+	KERN_ERR,
+};
+
 static void log_eavb(int level, const char *fmt, ...)
 {
 	va_list args;
-
+	char buf[128] = {0};
 	if ((level) >= log_level) {
 		va_start(args, fmt);
-		vprintk(fmt, args);
+		vsnprintf(buf, sizeof(buf), fmt, args);
 		va_end(args);
+		printk("%s%s", level_prefix[level], buf);
 	}
 }
 #define LOG_EAVB(level, format, args...) \
 log_eavb(level, "eavb: pid %.8x: %s: %s(%d) "format, \
-current->pid, prix[0x3 & (level)], __func__, __LINE__, ## args)
+current->pid, prix[level], __func__, __LINE__, ## args)
 
 #define ASSERT(x) \
 do { \
@@ -70,6 +81,9 @@ do { \
 } while (0)
 
 static unsigned int timeout_msec = 5000; /* default 5s */
+static unsigned int version_be_major = VERSION_MAJOR;
+static unsigned int version_be_minor = VERSION_MINOR;
+static unsigned int using_ver_check = 0;
 
 /*
  *    device_priv (struct virtio_eavb_priv)
@@ -195,6 +209,8 @@ static inline const char *cmd2str(uint32_t cmd)
 		return "VIRTIO_EAVB_T_MUNMAP";
 	case VIRTIO_EAVB_T_UPDATE_CLK:
 		return "VIRTIO_EAVB_T_UPDATE_CLK";
+	case VIRTIO_EAVB_T_VERSION:
+		return "VIRTIO_EAVB_T_VERSION";
 	default:
 		return "not supported";
 	}
@@ -846,6 +862,58 @@ static int virtio_eavb_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static int exchange_version(struct virtio_eavb_priv *priv)
+{
+	if (using_ver_check) {
+		struct fe_msg *msg;
+		struct vio_msg_hdr *vhdr;
+		struct vio_version_msg *vmsg;
+		int tsize, rsize;
+		int ret;
+
+		LOG_EAVB(LEVEL_INFO, "M - DRIVER EAVB FE version\n");
+
+		tsize = rsize = sizeof(struct vio_version_msg);
+		msg = virt_alloc_msg(priv, tsize, rsize);
+		if (!msg) {
+			LOG_EAVB(LEVEL_ERR, "version alloc msg fail!\n");
+			return -ENOMEM;
+		}
+
+		vhdr = (struct vio_msg_hdr *)msg->txbuf;
+		vhdr->cmd = VIRTIO_EAVB_T_VERSION;
+		vhdr->len = msg->txbuf_size;
+
+		vmsg = (struct vio_version_msg *)vhdr;
+		vmsg->major = VERSION_MAJOR;
+		vmsg->minor = VERSION_MINOR;
+
+		ret = send_msg(priv, msg);
+
+		vhdr = (struct vio_msg_hdr *)msg->rxbuf;
+		if (!ret && vhdr) {
+			ret = vhdr->result;
+
+			vmsg = (struct vio_version_msg *)vhdr;
+			version_be_major = vmsg->major;
+			version_be_minor = vmsg->minor;
+			LOG_EAVB(LEVEL_INFO, "version: fe (%u.%u) : be (%u.%u)\n", VERSION_MAJOR, VERSION_MINOR, version_be_major, version_be_minor);
+			if (version_be_major != VERSION_MAJOR) {
+				ret = -EOPNOTSUPP;
+				LOG_EAVB(LEVEL_ERR, "Major version mismatch!!!\n");
+			}
+		} else {
+			LOG_EAVB(LEVEL_INFO, "exchange_version failed\n");
+		}
+
+		virt_free_msg(priv, msg);
+
+		return ret;
+	} else {
+		return 0;
+	}
+}
+
 static int qavb_create_stream(struct eavb_file *fl, void __user *buf)
 {
 	struct virtio_eavb_priv *priv = fl->priv;
@@ -1228,7 +1296,7 @@ static int qavb_receive(struct eavb_file *fl, void __user *buf)
 		memcpy(&receive.data, &vmsg->data,
 				sizeof(struct eavb_buf_data));
 		if (receive.received)
-			LOG_EAVB(LEVEL_DEBUG, "M - DRIVER EAVB FE First received data\n");
+			LOG_EAVB(LEVEL_DEBUG, "M - DRIVER EAVB FE received data %d\n", receive.received);
 	}
 
 	virt_free_msg(priv, msg);
@@ -1304,6 +1372,10 @@ static int qavb_transmit(struct eavb_file *fl, void __user *buf)
 		ret = vhdr->result;
 		vmsg = (struct vio_transmit_msg *)vhdr;
 		transmit.written = vmsg->written;
+		memcpy(&transmit.data, &vmsg->data,
+				sizeof(struct eavb_buf_data));
+		if (transmit.written)
+			LOG_EAVB(LEVEL_DEBUG, "M - DRIVER EAVB FE transmitted data %d\n", transmit.written);
 	}
 
 	virt_free_msg(priv, msg);
@@ -1632,8 +1704,19 @@ static int virtio_eavb_probe(struct virtio_device *vdev)
 			priv->debugfs_root, NULL,
 			&fops_debugfs_timeout);
 #endif
+
+	ret = exchange_version(priv);
+	if (ret) {
+		goto exchange_version_fail;
+	}
+
 	LOG_EAVB(LEVEL_INFO, "M - DRIVER EAVB FE Ready\n");
 	return 0;
+
+exchange_version_fail:
+#ifdef EAVB_DEBUGFS
+	debugfs_remove_recursive(priv->debugfs_root);
+#endif
 
 alloc_rxbufs_fail:
 	device_destroy(priv->class, MKDEV(MAJOR(priv->dev_no), MINOR_NUM_DEV));
@@ -1673,6 +1756,54 @@ static void virtio_eavb_remove(struct virtio_device *vdev)
 	kfree(priv);
 }
 
+#ifdef CONFIG_PM_SLEEP
+static int virtio_eavb_freeze(struct virtio_device *vdev){
+
+	struct virtio_eavb_priv *priv;
+	LOG_EAVB(LEVEL_INFO, "M - DRIVER EAVB FREEZE \n");
+
+	priv = vdev->priv;
+
+	virtio_reset_device(vdev);
+	vdev->config->del_vqs(vdev);
+
+	return 0;
+}
+
+static int virtio_eavb_restore(struct virtio_device *vdev){
+
+	struct virtio_eavb_priv *priv = vdev->priv;
+	int ret,i;
+
+	LOG_EAVB(LEVEL_INFO, "M - DRIVER EAVB RESTORE \n");
+	ret = init_vqs(priv);
+	if (ret){
+		LOG_EAVB(LEVEL_ERR, "EAVB restore: init_vqs failed (%d)\n", ret);
+		return ret;
+	}
+
+	virtio_device_ready(vdev);
+
+	for (i = 0; i < FE_MSG_MAX; i++) {
+		struct scatterlist sg;
+		u8 *rxbuf;
+
+		rxbuf = priv->rxbufs[0] + i * RX_BUF_MAX_LEN;
+		priv->rxbufs[i] = rxbuf;
+
+		sg_init_one(&sg, rxbuf, RX_BUF_MAX_LEN);
+		ret = virtqueue_add_inbuf(priv->rvq, &sg, 1, rxbuf, GFP_KERNEL);
+		WARN_ON(ret);
+	}
+	virtqueue_disable_cb(priv->svq);
+
+	virtqueue_enable_cb(priv->rvq);
+	virtqueue_kick(priv->rvq);
+	LOG_EAVB(LEVEL_INFO, "M - DRIVER EAVB FE Ready\n");
+	return 0;
+}
+#endif
+
 
 static const struct virtio_device_id id_table[] = {
 	{ VIRTIO_ID_EAVB, VIRTIO_DEV_ANY_ID },
@@ -1692,6 +1823,11 @@ static struct virtio_driver virtio_eavb_driver = {
 	.id_table = id_table,
 	.probe = virtio_eavb_probe,
 	.remove = virtio_eavb_remove,
+
+#ifdef CONFIG_PM_SLEEP
+	.freeze = virtio_eavb_freeze,
+	.restore = virtio_eavb_restore,
+#endif
 };
 
 static int __init virtio_eavb_init(void)
@@ -1708,5 +1844,10 @@ static void __exit virtio_eavb_exit(void)
 module_init(virtio_eavb_init);
 module_exit(virtio_eavb_exit);
 
+module_param(using_ver_check, uint, 0644);
+MODULE_PARM_DESC(using_ver_check, "default(0): don't use version check, 1: use version check");
+
+module_param(log_level, uint, 0644);
+MODULE_PARM_DESC(log_level, "EAVB FE log level: 0=debug, 1=info, 2=warn, 3=err");
 MODULE_DESCRIPTION("Virtio eavb driver");
 MODULE_LICENSE("GPL");

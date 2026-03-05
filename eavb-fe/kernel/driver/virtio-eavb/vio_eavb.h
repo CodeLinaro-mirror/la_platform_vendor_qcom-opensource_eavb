@@ -11,8 +11,14 @@
 #define MAX_STREAM_NUM          8
 #define MAX_CONFIG_FILE_PATH    512
 
+enum {
+	EAVB_VERSION_0 = 0,
+	EAVB_VERSION_1,
+	EAVB_VERSION_2,
+};
 #define VERSION_MAJOR           1
-#define VERSION_MINOR           1
+#define VERSION_MINOR           EAVB_VERSION_0
+
 
 #define VIRTIO_EAVB_T_CREATE_STREAM     0
 #define VIRTIO_EAVB_T_GET_STREAM_INFO   1
@@ -192,6 +198,8 @@ struct eavb_stream_info {
 	uint32_t ring_buffer_size;
 	int blocking_write;
 	double fill_level;
+	int tx_pkts_per_sec;
+	double flow_rate;
 } __packed;
 
 
