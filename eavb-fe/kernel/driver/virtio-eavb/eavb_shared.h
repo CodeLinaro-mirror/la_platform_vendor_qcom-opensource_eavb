@@ -289,6 +289,7 @@ struct eavb_ioctl_stream_info {
 	int blocking_write;
 	double fill_level;
 	int tx_pkts_per_sec;
+	double flow_rate;
 } __packed;
 
 struct eavb_ioctl_get_stream_info {
