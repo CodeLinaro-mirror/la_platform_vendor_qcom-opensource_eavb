@@ -116,7 +116,23 @@ struct virtio_eavb_priv {
 	spinlock_t msglock;
 #define FE_MSG_MAX		256 /* 1<<8 */
 #define mod(index)		((index) & 0xff) /* ((index) % FE_MSG_MAX) */
+	/*
+	 * A msgid carries both the msgtable[] slot and a generation counter:
+	 *
+	 *   bit 15..8 : generation, incremented every time the slot is reused
+	 *   bit  7..0 : slot index into msgtable[]
+	 *
+	 * The generation lets fe_recv_done() tell a response that belongs to
+	 * the request currently owning the slot from a late response for an
+	 * already timed-out request whose slot has since been recycled.
+	 * vio_msg_hdr.msgid is a 16-bit field which the BE echoes verbatim,
+	 * so this needs no BE change.
+	 */
+#define msgslot(msgid)		((msgid) & 0xff)
+#define msgid_make(gen, slot)	((u16)((((gen) & 0xff) << 8) | msgslot(slot)))
 	struct fe_msg *msgtable[FE_MSG_MAX];
+	u8 generation[FE_MSG_MAX];
+	int next_msgslot;
 #define RX_BUF_MAX_LEN		1024
 	void *rxbufs[FE_MSG_MAX];
 	struct work_struct reclaim_work;
@@ -545,7 +561,6 @@ static struct fe_msg *virt_alloc_msg(struct virtio_eavb_priv *priv,
 	unsigned long flags;
 	u8 *buf;
 	int i;
-	static int next; /* default 0 */
 
 	ASSERT(rsize < RX_BUF_MAX_LEN);
 	/* kzalloc needn't memset 0 */
@@ -561,14 +576,27 @@ static struct fe_msg *virt_alloc_msg(struct virtio_eavb_priv *priv,
 		return NULL;
 	}
 
+	msg->txbuf = buf;
+	msg->txbuf_size = tsize;
+	msg->rxbuf = NULL;
+	msg->rxbuf_used = 0;
+	init_completion(&msg->work);
+
 	spin_lock_irqsave(&priv->msglock, flags);
 	for (i = 0; i < FE_MSG_MAX; i++) {
-		int index = mod(next + i);
+		int index = mod(priv->next_msgslot + i);
 
 		if (!priv->msgtable[index]) {
+			/*
+			 * Bump the generation on every reuse of the slot so a
+			 * stale response for a timed-out request cannot be
+			 * mistaken for a response to this one.
+			 */
+			priv->generation[index]++;
+			msg->msgid = msgid_make(priv->generation[index], index);
+			/* publish last */
 			priv->msgtable[index] = msg;
-			msg->msgid = index;
-			next = mod(index + 1);
+			priv->next_msgslot = mod(index + 1);
 			break;
 		}
 	}
@@ -581,10 +609,6 @@ static struct fe_msg *virt_alloc_msg(struct virtio_eavb_priv *priv,
 		return NULL;
 	}
 
-	msg->txbuf = buf;
-	msg->txbuf_size = tsize;
-	init_completion(&msg->work);
-
 	return msg;
 }
 
@@ -595,27 +619,43 @@ static void reclaim_rxbuf(struct virtio_eavb_priv *priv, void *rxbuf)
 
 	sg_init_one(&sg, rxbuf, RX_BUF_MAX_LEN);
 	spin_lock_irqsave(&priv->rvqlock, flags);
-	virtqueue_add_inbuf(priv->rvq, &sg, 1, rxbuf, GFP_KERNEL);
+
+	virtqueue_add_inbuf(priv->rvq, &sg, 1, rxbuf, GFP_ATOMIC);
 	virtqueue_kick(priv->rvq);
 	spin_unlock_irqrestore(&priv->rvqlock, flags);
 }
 
-static void virt_free_msg(struct virtio_eavb_priv *priv, struct fe_msg *msg)
+static void virt_free_msg(struct virtio_eavb_priv* priv, struct fe_msg* msg)
 {
 	unsigned long flags;
+	void* rxbuf;
+	u16 msgid = msg->msgid;
+	u8 slot = msgslot(msgid);
 
-	if (msg->rxbuf_used)
-		reclaim_rxbuf(priv, msg->rxbuf);
-
+	/*
+	 * Under msglock, unlink the message before freeing it 
+	 * and sample rxbuf/rxbuf_used to prevent concurrent 
+	 * fe_recv_done() access, dangling pointers, and RX-buffer leaks
+	 */
 	spin_lock_irqsave(&priv->msglock, flags);
-	if (priv->msgtable[msg->msgid] == msg)
-		priv->msgtable[msg->msgid] = NULL;
-	else
-		LOG_EAVB(LEVEL_ERR, "can't find msg %d in table\n",
-			msg->msgid);
+	if (priv->msgtable[slot] == msg) {
+		priv->msgtable[slot] = NULL;
+	}
+	else {
+		LOG_EAVB(LEVEL_ERR, "can't find msg %d in table\n", msgid);
+	}
+	rxbuf = msg->rxbuf_used ? msg->rxbuf : NULL;
+	kfree(msg);
 	spin_unlock_irqrestore(&priv->msglock, flags);
 
-	kfree(msg);
+	/*
+	 * Give the rx buffer back outside of msglock: reclaim_rxbuf() takes
+	 * rvqlock and we must not nest msglock -> rvqlock, since fe_recv_done()
+	 * acquires them in the opposite order.
+	 */
+	if (rxbuf)
+		reclaim_rxbuf(priv, rxbuf);
+
 	schedule_work(&priv->reclaim_work);
 }
 
@@ -652,9 +692,9 @@ static void reclaim_function(struct work_struct *work)
 		vhdr->stream_idx = stream->idx; \
 	} while (0)
 
-static int send_msg(struct virtio_eavb_priv *priv, struct fe_msg *msg)
+static int send_msg(struct virtio_eavb_priv* priv, struct fe_msg* msg)
 {
-	struct vio_msg_hdr *req, *rsp = NULL;
+	struct vio_msg_hdr* req, * rsp = NULL;
 	struct scatterlist sg[1];
 	int ret = 0;
 	int rsv;
@@ -662,11 +702,10 @@ static int send_msg(struct virtio_eavb_priv *priv, struct fe_msg *msg)
 	int32_t stream_idx_req, stream_idx_rsp = 0;
 	uint16_t msgid_req, msgid_rsp = 0;
 
-	req = (struct vio_msg_hdr *)msg->txbuf;
+	req = (struct vio_msg_hdr*)msg->txbuf;
 	msgid_req = msg->msgid;
 	cmd_req = req->cmd;
 	stream_idx_req = req->stream_idx;
-	msg->rxbuf = NULL;
 
 	if ((cmd_req != VIRTIO_EAVB_T_RECEIVE) && (cmd_req != VIRTIO_EAVB_T_TRANSMIT))
 		LOG_EAVB(LEVEL_INFO, "[eavb#%d] request: msgid %d, cmd %s\n",
@@ -693,8 +732,16 @@ static int send_msg(struct virtio_eavb_priv *priv, struct fe_msg *msg)
 		ret = -ETIMEDOUT;
 		goto error;
 	}
-	rsp = (struct vio_msg_hdr *)msg->rxbuf;
-	msgid_rsp = msg->msgid;
+	rsp = (struct vio_msg_hdr*)msg->rxbuf;
+	if (!rsp) {
+		LOG_EAVB(LEVEL_ERR, "fail to get rsp buffer, msgid %d\n",
+			msgid_req);
+		ret = -ENOMEM;
+		goto error;
+	}
+
+	/* validate the msgid echoed back by the BE, not our own copy */
+	msgid_rsp = rsp->msgid;
 	if (msgid_req != msgid_rsp) {
 		LOG_EAVB(LEVEL_ERR, "msgid mismatch, msgid_req %d, msgid_rsp %d\n",
 			msgid_req, msgid_rsp);
@@ -702,19 +749,12 @@ static int send_msg(struct virtio_eavb_priv *priv, struct fe_msg *msg)
 		goto error;
 	}
 
-	if (rsp) {
-		cmd_rsp = rsp->cmd;
-		stream_idx_rsp = rsp->stream_idx;
-		if (rsp->result) {
-			LOG_EAVB(LEVEL_ERR, "[eavb#%d] unexpected rsp: msgid %d, cmd %s, ret %d\n",
-				stream_idx_req, msgid_req, cmd2str(cmd_req), rsp->result);
-			ret = -EINVAL;
-		}
-	} else {
-		LOG_EAVB(LEVEL_ERR, "fail to get rsp buffer, msgid %d\n",
-			msgid_rsp);
-		ret = -ENOMEM;
-		goto error;
+	cmd_rsp = rsp->cmd;
+	stream_idx_rsp = rsp->stream_idx;
+	if (rsp->result) {
+		LOG_EAVB(LEVEL_ERR, "[eavb#%d] unexpected rsp: msgid %d, cmd %s, ret %d\n",
+			stream_idx_req, msgid_req, cmd2str(cmd_req), rsp->result);
+		ret = -EINVAL;
 	}
 
 	if ((ret != 0) ||
@@ -1526,7 +1566,7 @@ static void fe_recv_done(struct virtqueue *rvq)
 	struct vio_msg_hdr *rxvhdr, *rsp;
 	struct fe_msg *msg;
 	unsigned int len;
-	unsigned long flags;
+	unsigned long flags, msg_flags;
 #ifdef EAVB_DEBUGFS
 	int index;
 #endif
@@ -1544,6 +1584,7 @@ static void fe_recv_done(struct virtqueue *rvq)
 			LOG_EAVB(LEVEL_ERR,
 				"rxvhdr msgid %d len %d > received len %d!\n",
 				rxvhdr->msgid, rxvhdr->len, len);
+			reclaim_rxbuf(priv, rxvhdr);
 			continue;
 		}
 
@@ -1557,21 +1598,37 @@ static void fe_recv_done(struct virtqueue *rvq)
 		}
 
 		rsp = rxvhdr;
-		if (rsp->msgid > FE_MSG_MAX - 1) {
-			LOG_EAVB(LEVEL_ERR, "rsp msgid %d is invalid!\n",
-				rsp->msgid);
-			continue;
-		}
 
-		msg = priv->msgtable[rsp->msgid];
+		/* 
+		 * Return the RX buffer to the RVQ whenever a response is dropped 
+		 * to prevent buffer starvation and stop the FE from receiving responses
+		 */
+		spin_lock_irqsave(&priv->msglock, msg_flags);
+		msg = priv->msgtable[msgslot(rsp->msgid)];
 		if (!msg) {
+			spin_unlock_irqrestore(&priv->msglock, msg_flags);
 			LOG_EAVB(LEVEL_ERR, "rsp msgid %d found no msg!\n",
 				rsp->msgid);
+			reclaim_rxbuf(priv, rxvhdr);
 			continue;
 		}
 		if (msg->msgid != rsp->msgid) {
-			LOG_EAVB(LEVEL_ERR, "rsp msgid %d mismatch %d!\n",
+			/* 
+			 * Drop late responses with a stale generation 
+			 * to avoid completing the recycled slot owner with foreign data. 
+			 */
+			spin_unlock_irqrestore(&priv->msglock, msg_flags);
+			LOG_EAVB(LEVEL_ERR, "stale rsp msgid %d mismatch %d!\n",
 				rsp->msgid, msg->msgid);
+			reclaim_rxbuf(priv, rxvhdr);
+			continue;
+		}
+		if (msg->rxbuf_used) {
+			/* duplicate response for the same request */
+			spin_unlock_irqrestore(&priv->msglock, msg_flags);
+			LOG_EAVB(LEVEL_ERR, "duplicate rsp msgid %d!\n",
+				rsp->msgid);
+			reclaim_rxbuf(priv, rxvhdr);
 			continue;
 		}
 
@@ -1585,6 +1642,7 @@ static void fe_recv_done(struct virtqueue *rvq)
 		priv->next_rxrecords_index++;
 #endif
 		complete(&msg->work);
+		spin_unlock_irqrestore(&priv->msglock, msg_flags);
 	}
 }
 
